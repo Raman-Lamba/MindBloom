@@ -2,116 +2,165 @@ import OpenAI from "openai";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import { pipeline } from "@huggingface/transformers";
 import dotenv from "dotenv";
-import path from "path";
-import { fileURLToPath } from "url";
-import crypto from "crypto";
-import pkg from 'pdf.js-extract';
-import fs from 'fs/promises';
 import { readFile } from "fs/promises";
+dotenv.config();
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+// const {PDFExtract, PDFExtractOptions} = pkg;
+// const pdfExtract = new PDFExtract();
+// const options = {}; /* see below */
+// const pdfPath = './documents/psch1.pdf';
+// const outputPath = './extracted-text.txt';
 
-dotenv.config({ path: path.resolve(__dirname, '../.env') });
+// async function extractTextFromPDF(pdfPath) {
+//     try {
+//         const data = await pdfExtract.extract(pdfPath, options);
+//         // return data.pages[23].content[56].str;
+//         const fullText = data.pages.map(
+//             page => page.content.map(
+//                 item => item.str
+//             ).join(' ')
+//         ).join('\n');
+//         return fullText;
+//     } catch (err) {
+//         console.error('Error extracting text from PDF:', err);
+//         return null;
+//     }
+// }
+// const text = await extractTextFromPDF(pdfPath);
 
-// Configuration constants
-const EMBEDDING_CACHE_PATH = path.resolve(__dirname, '../caches/embedding-cache.json');
-const CHUNK_CACHE_PATH = path.resolve(__dirname, '../caches/chunk-cache.json');
-const TEXT_CACHE_PATH = path.resolve(__dirname, '../caches/extracted-text.txt');
-const MAX_HISTORY_LENGTH = 7;  // Keeps last 3 exchanges + current
+// await fs.writeFile(outputPath, text, 'utf-8');
 
-// System prompt template
-const systemPrompt = `You are an expert psychology consultant with extensive knowledge in clinical psychology, 
-therapeutic approaches, and mental health support. You have access to a comprehensive psychology textbook, whose most matching content you are getting. 
-For any questions: 1. Analyze relevant textbook sections 2. Provide actionable guidance 
-3. Acknowledge limitations 4. Maintain contextual awareness of previous questions. Respond with academic rigor 
-and practical compassion. 5. On a side note try to make it fast, efficient and relatable.`;
+// // Prepare data
+const outputPath = './theHolyGrail.txt';
 
-async function getTextHash(text) {
-    return crypto.createHash('sha256').update(text).digest('hex');
+async function loadChat() {
+    try{
+        const chat = await readFile(outputPath,"utf-8");
+        // console.log("Chat loaded", chat.slice(0,1000));
+        return chat;
+    }catch (err){
+        console.error("Error reading file:",err);
+        return "";
+    }
 }
 
-async function loadOrGenerateEmbeddings(text) {
+const chat = await loadChat();
+
+const textSplitter = new RecursiveCharacterTextSplitter({
+    chunkSize: 1000,
+    chunkOverlap: 300,
+});
+const chunks = await textSplitter.splitText(chat);
+const extractor = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2", { device: 'cpu' });
+
+// function batchArray(array, batchSize) {
+//     const batches = [];
+//     for (let i = 0; i < array.length; i += batchSize) {
+//         batches.push(array.slice(i, i + batchSize));
+//     }
+//     return batches;
+// }
+// const batchedChunks = batchArray(chunks, 16); // Adjust batch size based on memory
+// Clear existing embeddings
+// Clear existing embeddings
+// Replace the entire embedding processing loop with this:
+
+let embeddings = [];
+
+for (const chunk of chunks) {
     try {
-        const [cache, existingChunks] = await Promise.all([
-            fs.readFile(EMBEDDING_CACHE_PATH, 'utf-8').then(JSON.parse).catch(() => null),
-            fs.readFile(CHUNK_CACHE_PATH, 'utf-8').then(JSON.parse).catch(() => null)
-        ]);
+        const result = await extractor(chunk, { 
+            pooling: "mean", 
+            normalize: true 
+        });
 
-        const currentHash = await getTextHash(text);
-        
-        if (cache?.hash === currentHash && existingChunks?.length) {
-            console.log('Using cached embeddings and chunks');
-            return { embeddings: cache.embeddings, chunks: existingChunks };
+        // Convert tensor to array properly
+        let embeddingVector;
+        if (result && result.data) {
+            // Handle tensor format
+            embeddingVector = Array.from(result.data);
+        } else if (Array.isArray(result)) {
+            // Direct array case
+            embeddingVector = result;
+        } else {
+            console.error("Unexpected embedding format:", result);
+            continue;
         }
+
+        // Validate embedding dimensions
+        if (embeddingVector.length === 384) { // MiniLM-L6-v2 has 384-dim embeddings
+            embeddings.push(embeddingVector);
+        } else {
+            console.warn(`Invalid embedding dimension: ${embeddingVector.length}`);
+        }
+
     } catch (error) {
-        console.log('Cache invalid, regenerating...');
+        console.error("Error processing chunk:", error);
     }
-
-    // Generate fresh embeddings if no valid cache
-    const textSplitter = new RecursiveCharacterTextSplitter({
-        chunkSize: 1000,
-        chunkOverlap: 300,
-    });
-    const chunks = await textSplitter.splitText(text);
-    const extractor = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2", { device: 'cpu' });
-
-    const embeddings = [];
-    for (const chunk of chunks) {
-        const result = await extractor(chunk, { pooling: "mean", normalize: true });
-        embeddings.push(Array.from(result.data));
-    }
-
-    const processedEmbeddings = embeddings.filter(e => e.length === 384);
-    
-    // Save to cache
-    await Promise.all([
-        fs.writeFile(EMBEDDING_CACHE_PATH, JSON.stringify({
-            hash: await getTextHash(text),
-            embeddings: processedEmbeddings
-        })),
-        fs.writeFile(CHUNK_CACHE_PATH, JSON.stringify(chunks)),
-        fs.writeFile(TEXT_CACHE_PATH, text)
-    ]);
-
-    return { embeddings: processedEmbeddings, chunks };
 }
-
-// Cosine similarity function
+const processedEmbeddings = embeddings.filter(e => e && e.length); // Only keep valid embeddings
+// Function to calculate cosine similarity between two vectors
 function cosineSimilarity(vecA, vecB) {
-    let dotProduct = 0, magnitudeA = 0, magnitudeB = 0;
-    for (let i = 0; i < vecA.length; i++) {
-        dotProduct += vecA[i] * vecB[i];
-        magnitudeA += vecA[i] ** 2;
-        magnitudeB += vecB[i] ** 2;
+    if (vecA.length !== vecB.length) {
+        throw new Error("Vectors must be the same length for cosine similarity.");
     }
-    return dotProduct / (Math.sqrt(magnitudeA) * Math.sqrt(magnitudeB) || 1e-9);
+
+    let dotProduct = 0;
+    let magnitudeA = 0;
+    let magnitudeB = 0;
+
+    for (let i = 0; i < vecA.length; i++) {
+        const a = vecA[i];
+        const b = vecB[i];
+
+        dotProduct += a * b;
+        magnitudeA += a * a;
+        magnitudeB += b * b;
+    }
+
+    const denominator = Math.sqrt(magnitudeA) * Math.sqrt(magnitudeB);
+    return denominator === 0 ? 0 : dotProduct / denominator;
 }
+
 
 class RetrievalTool {
     constructor(embeddings, chunks) {
         this.embeddings = embeddings;
         this.chunks = chunks;
-        this.extractor = null;
     }
 
-    async initializeExtractor() {
-        if (!this.extractor) {
-            this.extractor = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2", { device: 'cpu' });
+    flattenEmbedding(embedding) {
+        if (embedding && embedding.data) {
+            return Array.from(embedding.data);
         }
+        // Handle array format
+        if (Array.isArray(embedding)) {
+            return embedding;
+        }
+        // Fallback
+        return Array.from(embedding);
     }
 
     async retrieve(query, k = 5) {
-        await this.initializeExtractor();
-        const [queryEmbedding] = await this.extractor([query], { pooling: "mean", normalize: true });
-        const queryVec = Array.from(queryEmbedding.data);
+        const queryEmbedding = await extractor([query], { pooling: "mean", normalize: true });
+        const queryVec = this.flattenEmbedding(queryEmbedding[0]);
+        
+        console.log(`Query vector length: ${queryVec.length}`);
+        console.log(`First embedding vector length: ${this.flattenEmbedding(this.embeddings[0]).length}`);
+    
 
-        const similarities = this.embeddings.map((embedding, index) => ({
-            index,
-            text: this.chunks[index],
-            similarity: cosineSimilarity(queryVec, embedding)
-        }));
-
+        const similarities = this.embeddings.map((embedding, index) => {
+            const embeddingVec = this.flattenEmbedding(embedding);
+            if (queryVec.length !== embeddingVec.length) {
+                console.warn(`Vector mismatch at index ${index}: query ${queryVec.length}, embedding ${embeddingVec.length}`);
+            }
+            return {
+                index,
+                text: this.chunks[index],
+                similarity: cosineSimilarity(queryVec, embeddingVec)
+            };
+        });
+    
         return similarities.sort((a, b) => b.similarity - a.similarity).slice(0, k);
     }
 }
@@ -120,48 +169,31 @@ class Agent {
     constructor(llm, retrievalTool) {
         this.llm = llm;
         this.retrievalTool = retrievalTool;
-        this.conversationHistory = [];
-    }
-
-    trimHistory() {
-        if (this.conversationHistory.length > MAX_HISTORY_LENGTH) {
-            this.conversationHistory = this.conversationHistory.slice(-MAX_HISTORY_LENGTH);
-        }
     }
 
     async answerQuestion(query, k = 5) {
         try {
-            this.conversationHistory.push({ role: 'user', content: query });
-            this.trimHistory();
-
             const relevantChunks = await this.retrievalTool.retrieve(query, k);
-            const contextText = relevantChunks.map(result => result.text).join("\n\n");
-
-            const messages = [
-                {
-                    role: "system",
-                    content: `${systemPrompt}\n\nConversation Context: ${this.conversationHistory
-                        .slice(0, -1)
-                        .map(m => `${m.role}: ${m.content}`)
-                        .join('\n')}`
-                },
-                ...this.conversationHistory.slice(-3),
-                {
-                    role: "user",
-                    content: `Document Context:\n${contextText}\n\nCurrent Question: ${query}`
-                }
-            ];
-
-            const response = await this.llm.chat.completions.create({
-                model: "mistralai/mistral-small-3.1-24b-instruct:free",
-                messages,
+            
+            console.log("\n=== Retrieved Information ===");
+            relevantChunks.forEach((result, i) => {
+                console.log(`${i+1}. Similarity: ${result.similarity.toFixed(4)}`);
+                console.log(`   Text: "${result.text}"`);
             });
 
-            const answer = response.choices[0].message.content;
-            this.conversationHistory.push({ role: 'assistant', content: answer });
-            this.trimHistory();
+            const contextText = relevantChunks.map(result => result.text).join("\n\n");
+            const response = await this.llm.chat.completions.create({
+                model: "mistralai/mistral-small-3.1-24b-instruct:free",
+                messages: [{
+                    role: "system",
+                    content: "You are an expert psychology consultant with extensive knowledge in clinical psychology, therapeutic approaches, and mental health support. You have context of a book.For any questions user asks: 1.Analyze the context and answer the question based on the context. 2. If the context doesn't have the answer then say 'I don't know'. 3. Give a detailed answer that satisfies the user's question."
+                }, {
+                    role: "user",
+                    content: `Context:\n${contextText}\n\nQuestion: ${query}`
+                }],
+            });
 
-            return answer;
+            return response.choices[0].message.content;
         } catch (error) {
             console.error("Agent error:", error);
             return "Sorry, I encountered an error while processing your request.";
@@ -169,53 +201,16 @@ class Agent {
     }
 }
 
-// Initialization
-// async function initializeAgent() {
-//     // Load source text
-//     const chat = await readFile(TEXT_CACHE_PATH, "utf-8").catch(() => "");
-    
-//     // Load or generate embeddings
-//     const { embeddings, chunks } = await loadOrGenerateEmbeddings(chat);
+// Initialize components
+const llm = new OpenAI({
+    baseURL: 'https://openrouter.ai/api/v1',
+    apiKey: process.env.OPENROUTER_API_KEY,
+});
+const retrievalTool = new RetrievalTool(processedEmbeddings, chunks);
+const agent = new Agent(llm, retrievalTool);
 
-//     // Initialize components
-//     const llm = new OpenAI({
-//         baseURL: 'https://openrouter.ai/api/v1',
-//         apiKey: process.env.OPENROUTER_API_KEY,
-//     });
-//     const retrievalTool = new RetrievalTool(embeddings, chunks);
-//     return new Agent(llm, retrievalTool);
-// }
-
-export async function initializeAgent() {
-    try {
-        // Load source text
-        const text = await readFile(TEXT_CACHE_PATH, "utf-8").catch(async () => {
-            console.log("No text cache found, creating empty file");
-            await fs.mkdir(path.dirname(TEXT_CACHE_PATH), { recursive: true });
-            // You should replace this with your actual document text source
-            const defaultText = "This is a placeholder for the psychology textbook content.";
-            await fs.writeFile(TEXT_CACHE_PATH, defaultText);
-            return defaultText;
-        });
-        
-        // Load or generate embeddings
-        const { embeddings, chunks } = await loadOrGenerateEmbeddings(text);
-
-        // Initialize components
-        const llm = new OpenAI({
-            baseURL: 'https://openrouter.ai/api/v1',
-            apiKey: process.env.OPENROUTER_API_KEY,
-        });
-        const retrievalTool = new RetrievalTool(embeddings, chunks);
-        return new Agent(llm, retrievalTool);
-    } catch (error) {
-        console.error("Failed to initialize agent:", error);
-        throw error;
-    }
-}
-
-// Query handler
-async function handleQuery(agent, query) {
+// Query handler with formatted output
+async function handleQuery(query) {
     console.log(`\n=== Processing Query: "${query}" ===`);
     const start = Date.now();
     
@@ -223,16 +218,8 @@ async function handleQuery(agent, query) {
     
     console.log("\n=== Final Answer ===");
     console.log(answer);
-    console.log(`Processed in ${(Date.now() - start)/1000}s`);
-    return answer;
+    console.log(`\nProcessed in ${(Date.now() - start)/1000} seconds`);
 }
 
-// Execution
-// (async () => {
-//     const agent = await initializeAgent();
-    
-//     // Example conversation
-//     await handleQuery(agent, "What should I do if I am stressed?");
-//     await handleQuery(agent, "How does that apply to work-related stress specifically?");
-//     await handleQuery(agent, "Can you suggest some quick relaxation techniques?");
-// })();
+// Execute sample query
+handleQuery("What is stress?");
